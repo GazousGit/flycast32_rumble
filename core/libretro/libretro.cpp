@@ -28,6 +28,14 @@ char* strdup(const char *str)
 
 #include <sys/stat.h>
 #include <file/file_path.h>
+#ifdef __linux__
+#include <fcntl.h>
+#include <unistd.h>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#endif
 
 #include <libretro.h>
 
@@ -133,6 +141,129 @@ bool enable_purupuru = true;
 static u32 vib_stop_time[4];
 static double vib_strength[4];
 static double vib_delta[4];
+
+#ifdef __linux__
+// Vibration motor of the rk3326 handhelds (R36S and clones), driven by the core
+// like the ArkOS rumble patch does, with the same sysfs files and values. That
+// patch spawned a shell (or sudo) on the emulation thread for every command;
+// here a small thread does the writes and ends each pulse.
+struct pwm_motor_t
+{
+   const char *path;
+   const char *on;
+   const char *off;
+};
+static const pwm_motor_t pwm_motors[] = {
+   { "/sys/class/pwm/pwmchip0/pwm0/duty_cycle", "10", "1000000" },
+   { "/sys/class/pwm/pwmchip1/pwm0/enable",     "0",  "1" },
+};
+#define PWM_MIN_PULSE_MS 400
+
+static const pwm_motor_t *pwm_motor;
+static int pwm_fd = -1;    // not writable by this user: fall back to sudo tee
+static bool pwm_probed;
+static bool pwm_want;
+static bool pwm_quit;
+static std::chrono::steady_clock::time_point pwm_off_at;
+static std::mutex pwm_mutex;
+static std::condition_variable pwm_cv;
+static std::thread pwm_thread;
+
+static void pwm_write(bool on)
+{
+   const char *value = on ? pwm_motor->on : pwm_motor->off;
+   if (pwm_fd >= 0)
+   {
+      if (pwrite(pwm_fd, value, strlen(value), 0) < 0)
+         WARN_LOG(INPUT, "rumble: cannot write %s", pwm_motor->path);
+   }
+   else
+   {
+      char cmd[128];
+      snprintf(cmd, sizeof(cmd), "echo %s | sudo tee %s > /dev/null", value, pwm_motor->path);
+      if (system(cmd) != 0)
+         WARN_LOG(INPUT, "rumble: '%s' failed", cmd);
+   }
+}
+
+static void pwm_worker()
+{
+   bool motor = false;
+   std::unique_lock<std::mutex> lock(pwm_mutex);
+   while (true)
+   {
+      if (pwm_want && std::chrono::steady_clock::now() >= pwm_off_at)
+         pwm_want = false;
+      bool want = pwm_want && !pwm_quit;
+      if (want != motor)
+      {
+         motor = want;
+         lock.unlock();
+         pwm_write(motor);
+         lock.lock();
+         continue;
+      }
+      if (pwm_quit)
+         break;
+      if (motor)
+         pwm_cv.wait_until(lock, pwm_off_at);
+      else
+         pwm_cv.wait(lock);
+   }
+}
+
+// Motor on for at least PWM_MIN_PULSE_MS (a shorter pulse is not felt), or off.
+static void pwm_rumble(bool on, u32 duration_ms)
+{
+   if (!pwm_probed)
+   {
+      pwm_probed = true;
+      for (const pwm_motor_t &m : pwm_motors)
+      {
+         if (access(m.path, F_OK) != 0)
+            continue;
+         pwm_motor = &m;
+         pwm_fd = open(m.path, O_WRONLY | O_CLOEXEC);
+         pwm_quit = false;
+         pwm_want = false;
+         pwm_thread = std::thread(pwm_worker);
+         INFO_LOG(INPUT, "rumble: motor %s%s", m.path, pwm_fd < 0 ? " (through sudo)" : "");
+         break;
+      }
+   }
+   if (pwm_motor == NULL)
+      return;
+   {
+      std::lock_guard<std::mutex> lock(pwm_mutex);
+      pwm_want = on;
+      if (on)
+         pwm_off_at = std::chrono::steady_clock::now()
+            + std::chrono::milliseconds(std::max<u32>(duration_ms, PWM_MIN_PULSE_MS));
+   }
+   pwm_cv.notify_one();
+}
+
+static void pwm_rumble_term()
+{
+   if (pwm_thread.joinable())
+   {
+      {
+         std::lock_guard<std::mutex> lock(pwm_mutex);
+         pwm_quit = true;
+      }
+      pwm_cv.notify_one();
+      pwm_thread.join();
+   }
+   if (pwm_fd >= 0)
+      close(pwm_fd);
+   pwm_fd = -1;
+   pwm_motor = NULL;
+   pwm_probed = false;
+}
+#else
+static void pwm_rumble(bool on, u32 duration_ms) { }
+static void pwm_rumble_term() { }
+#endif
 
 unsigned per_content_vmus = 0;
 
@@ -355,6 +486,7 @@ void retro_deinit(void)
    mtx_serialization.lock();
    mtx_serialization.unlock();
 
+   pwm_rumble_term();
    libretro_supports_bitmasks = false;
    LogManager::Shutdown();
 }
@@ -578,32 +710,28 @@ static void update_variables(bool first_startup)
       DEBUG_LOG(COMMON, "Got size: %u x %u.\n", screen_width, screen_height);
    }
 
+   // Cycle multiplier of every SH4 block: "dNN" = NN/10 (d16 = x1.6 = 125 MHz).
+   // A plain number is taken as MHz (retrorun.cfg: reicast_sh4clock = 130).
+   // Without a usable value (old retrorun builds do not return option defaults)
+   // the multiplier stayed 0 and blocks cost no cycles; use the option default.
    var.key = CORE_OPTION_NAME "_sh4clock";
-
-      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   settings.dreamcast.sh4clock = 1.2f;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (var.value[0] == 'd')
       {
-
-         if (!strcmp(var.value, "d20"))
-            settings.dreamcast.sh4clock = 2.0;
-         else if (!strcmp(var.value, "d18"))
-            settings.dreamcast.sh4clock = 1.8;
-         else if (!strcmp(var.value, "d16"))
-            settings.dreamcast.sh4clock = 1.6;
-         else if (!strcmp(var.value, "d14"))
-            settings.dreamcast.sh4clock = 1.4;         
-         else if (!strcmp(var.value, "d12"))
-            settings.dreamcast.sh4clock = 1.2;
-         else if (!strcmp(var.value, "d10"))
-            settings.dreamcast.sh4clock = 1.0;
-          else if (!strcmp(var.value, "d9"))
-            settings.dreamcast.sh4clock = 0.9;
-          else if (!strcmp(var.value, "d8"))
-            settings.dreamcast.sh4clock = 0.8;
-          else if (!strcmp(var.value, "d7"))
-            settings.dreamcast.sh4clock = 0.7;
-          else if (!strcmp(var.value, "d6"))
-            settings.dreamcast.sh4clock = 0.6;
+         int tenths = atoi(var.value + 1);
+         if (tenths >= 5 && tenths <= 20)
+            settings.dreamcast.sh4clock = tenths / 10.0f;
       }
+      else
+      {
+         int mhz = atoi(var.value);
+         if (mhz >= 50 && mhz <= 400)
+            settings.dreamcast.sh4clock = 200.0f / mhz;
+      }
+   }
+   INFO_LOG(COMMON, "SH4 clock multiplier %.2f (%.0f MHz)", settings.dreamcast.sh4clock, 200.0f / settings.dreamcast.sh4clock);
 
 
    var.key = CORE_OPTION_NAME "_cpu_mode";
@@ -2114,6 +2242,7 @@ void retro_unload_game(void)
    else
 #endif
 	   dc_term();
+   pwm_rumble_term();
 }
 
 
@@ -2409,6 +2538,7 @@ static void refresh_devices(bool first_startup)
       if (settings.System == DC_PLATFORM_DREAMCAST)
          maple_ReconnectDevices();
 
+      pwm_rumble(false, 0);
       if (rumble.set_rumble_state)
       {
          for(int i = 0; i < MAPLE_PORTS; i++)
@@ -3155,9 +3285,6 @@ void UpdateInputState(u32 port)
 
 void UpdateVibration(u32 port, u32 value, u32 max_duration)
 {
-   if (!rumble.set_rumble_state)
-      return;
-
    u8 POW_POS = (value >> 8) & 0x7;
    u8 POW_NEG = (value >> 12) & 0x7;
    u8 FREQ = (value >> 16) & 0xFF;
@@ -3169,14 +3296,23 @@ void UpdateVibration(u32 port, u32 value, u32 max_duration)
    bool CNT = value & 1;
 
    double pow         = std::min((POW_POS + POW_NEG) / 7.0, 1.0);
+   u32 duration;
+   if (FREQ > 0 && (!CNT || INC))
+	  duration = std::min((int)(1000 * (INC ? abs(INC) * std::max(POW_POS, POW_NEG) : 1) / FREQ), (int)max_duration);
+   else
+	  duration = max_duration;
+
+   if (port == 0)
+      pwm_rumble(pow > 0, duration);
+
+   if (!rumble.set_rumble_state)
+      return;
+
    vib_strength[port] = pow;
 
    rumble.set_rumble_state(port, RETRO_RUMBLE_STRONG, (u16)(65535 * pow));
 
-   if (FREQ > 0 && (!CNT || INC))
-	  vib_stop_time[port] = get_time_ms() + std::min((int)(1000 * (INC ? abs(INC) * std::max(POW_POS, POW_NEG) : 1) / FREQ), (int)max_duration);
-   else
-	  vib_stop_time[port] = get_time_ms() + max_duration;
+   vib_stop_time[port] = get_time_ms() + duration;
    if (INC == 0 || pow == 0)
 	  vib_delta[port] = 0.0;
    else
