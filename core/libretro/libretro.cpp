@@ -2422,7 +2422,7 @@ const char* retro_get_system_directory(void)
 
 void retro_get_system_info(struct retro_system_info *info)
 {
-   info->library_name = "Flycast32 Rumble";
+   info->library_name = "Flycast32 Rumble Hack";
 #ifndef GIT_VERSION
 #define GIT_VERSION ""
 #endif

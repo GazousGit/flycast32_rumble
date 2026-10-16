@@ -1,8 +1,8 @@
 # Software Information
-display_name = "Sega - Dreamcast/Naomi (Flycast Rumble)"
+display_name = "Sega - Dreamcast/Naomi (Flycast32 Rumble Hack)"
 authors = "flyinghead, DariusG"
 supported_extensions = "chd|cdi|elf|bin|cue|gdi|lst|zip|dat|7z|m3u"
-corename = "Flycast Rumble"
+corename = "Flycast32 Rumble Hack"
 license = "GPLv2"
 permissions = ""
 categories = "Emulator"

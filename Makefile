@@ -23,7 +23,7 @@ HAVE_CLANG    ?= 0
 HAVE_CDROM    := 0
 ENABLE_MODEM  := 1
 
-TARGET_NAME   := flycast32_rumble
+TARGET_NAME   := flycast32_rumble_hack
 
 ifeq ($(HAVE_CLANG),1)
 	CXX      = ${CC_PREFIX}clang++
